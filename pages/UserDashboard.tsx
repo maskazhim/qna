@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useApp } from '../context/AppContext';
 import { GlassCard } from '../components/GlassCard';
 import { Button } from '../components/Button';
-import { Hand, LogOut, Clock, Building2, Mic, PartyPopper, CheckCircle, Loader2 } from 'lucide-react';
+import { Hand, LogOut, Clock, Building2, Mic, PartyPopper, CheckCircle, Loader2, Hourglass } from 'lucide-react';
 
 export const UserDashboard: React.FC = () => {
   const { user, logout, isSessionActive, raiseHand, currentUserRank, activeSpeakerId, queue, isLoading } = useApp();
@@ -151,7 +151,7 @@ export const UserDashboard: React.FC = () => {
               <div className="flex flex-col items-center animate-[fadeIn_0.5s_ease-out]">
                  <Loader2 size={60} className="animate-spin text-green-500 mb-2" />
                  <span className="text-lg font-bold text-green-700">Berhasil!</span>
-                 <span className="text-xs font-medium text-green-600/80 mt-1">Cek urutan valid...</span>
+                 <span className="text-xs font-medium text-green-600/80 mt-1">Verifikasi antrian...</span>
               </div>
             ) : isSubmitting ? (
               <div className="flex flex-col items-center">
@@ -159,10 +159,10 @@ export const UserDashboard: React.FC = () => {
                  <span className="text-base font-semibold text-slate-500">Mengirim...</span>
               </div>
             ) : currentUserRank ? (
-              <>
-                <div className="text-6xl font-bold">{currentUserRank}</div>
-                <span className="text-sm font-semibold tracking-wider text-green-700">URUTAN ANDA</span>
-              </>
+              <div className="flex flex-col items-center animate-[fadeIn_0.5s_ease-out]">
+                <Hourglass size={80} className="animate-pulse text-green-500" />
+                <span className="text-xl font-bold tracking-wider uppercase text-green-700 mt-2">DALAM ANTRIAN</span>
+              </div>
             ) : (
               <>
                 <Hand size={80} strokeWidth={1.5} className={isSessionActive ? "animate-bounce drop-shadow-md" : ""} />
@@ -178,10 +178,10 @@ export const UserDashboard: React.FC = () => {
           {isActiveSpeaker 
             ? "Admin telah memilih Anda. Silahkan ajukan pertanyaan Anda sekarang."
             : isValidatingRank
-              ? "Permintaan Anda telah diterima server. Sedang mengambil nomor urutan valid..."
+              ? "Permintaan Anda telah diterima. Mohon tunggu sebentar..."
               : isSessionActive 
                 ? currentUserRank 
-                  ? "Anda sudah dalam antrian. Mohon tunggu giliran Anda dipanggil." 
+                  ? "Anda sudah masuk dalam daftar antrian. Mohon tunggu giliran Anda dipanggil." 
                   : "Tekan tombol di atas untuk masuk ke dalam antrian pertanyaan."
                 : "Admin belum memulai sesi tanya jawab. Tombol akan aktif secara otomatis saat sesi dimulai."}
         </p>
@@ -196,16 +196,13 @@ export const UserDashboard: React.FC = () => {
               <div className="w-16 h-16 bg-green-100 text-green-600 rounded-full flex items-center justify-center mx-auto mb-4 border border-green-200">
                 <CheckCircle size={32} />
               </div>
-              <h3 className="text-2xl font-bold text-slate-800 mb-2">Urutan Dikonfirmasi</h3>
-              <p className="text-slate-600 mb-4">Anda resmi terdaftar di antrian.</p>
+              <h3 className="text-2xl font-bold text-slate-800 mb-2">Berhasil Masuk</h3>
+              <p className="text-slate-600 mb-6">
+                Nama Anda telah tercatat di dalam antrian penanya. Admin akan memanggil Anda sesuai urutan.
+              </p>
               
-              <div className="bg-slate-50 rounded-xl p-4 border border-slate-100 mb-4">
-                <p className="text-xs text-slate-400 uppercase tracking-wider font-semibold mb-1">Nomor Urut</p>
-                <p className="text-4xl font-bold text-blue-600">{currentUserRank}</p>
-              </div>
-
               <Button className="w-full" variant="primary" onClick={() => setShowRankPopup(false)}>
-                Mengerti
+                Baik, Saya Tunggu
               </Button>
             </GlassCard>
           </div>
