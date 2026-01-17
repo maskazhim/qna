@@ -10,7 +10,12 @@ export const UserDashboard: React.FC = () => {
   const [showSelectedPopup, setShowSelectedPopup] = useState(false);
 
   // Determine if current user is the active speaker
-  const currentUserId = queue.find(q => q.name === user?.name)?.id;
+  // FIX: Match both Name AND BusinessName to ensure uniqueness
+  const currentUserId = queue.find(q => 
+    q.name === user?.name && 
+    q.businessName === user?.businessName
+  )?.id;
+
   const isActiveSpeaker = currentUserId && activeSpeakerId === currentUserId;
 
   useEffect(() => {

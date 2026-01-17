@@ -33,20 +33,28 @@ export const AdminDashboard: React.FC = () => {
 
   const [activeTab, setActiveTab] = useState<'live' | 'history'>('live');
 
-  const formatTime = (timestamp: number) => {
-    return new Date(timestamp).toLocaleTimeString('id-ID', { 
-      hour: '2-digit', 
-      minute: '2-digit',
-      second: '2-digit'
-    });
+  const formatTime = (timestamp: number | string) => {
+    try {
+      return new Date(timestamp).toLocaleTimeString('id-ID', { 
+        hour: '2-digit', 
+        minute: '2-digit',
+        second: '2-digit'
+      });
+    } catch (e) {
+      return '-';
+    }
   };
 
-  const formatDate = (timestamp: number) => {
-    return new Date(timestamp).toLocaleDateString('id-ID', {
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric'
-    });
+  const formatDate = (timestamp: number | string) => {
+    try {
+      return new Date(timestamp).toLocaleDateString('id-ID', {
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric'
+      });
+    } catch (e) {
+      return '-';
+    }
   };
 
   return (
@@ -119,8 +127,6 @@ export const AdminDashboard: React.FC = () => {
                        <span className="text-xl font-bold">{queue.length}</span>
                     </div>
                  </div>
-                 
-                 {/* Desktop Stats Card (Hidden on mobile inside this grid, shown below in original layout if needed, but we merged it for mobile) */}
               </div>
 
               <div className="col-span-1 w-full lg:w-full">
@@ -189,14 +195,21 @@ export const AdminDashboard: React.FC = () => {
                  {queue.length === 0 ? (
                    <div className="flex flex-col items-center justify-center py-12 md:py-24 text-slate-400 border-2 border-dashed border-slate-200 rounded-2xl bg-white/30">
                      <ListOrdered size={32} className="md:w-12 md:h-12 mb-4 opacity-20" />
-                     <p className="text-base md:text-lg font-medium">Daftar antrian kosong</p>
-                     {isSessionActive && <p className="text-xs md:text-sm mt-2 text-slate-500 animate-pulse">Menunggu peserta mengangkat tangan...</p>}
+                     <p className="text-base md:text-lg font-medium">
+                        {isSessionActive ? "Daftar antrian kosong" : "Sesi ditutup, antrian dikosongkan"}
+                     </p>
+                     {isSessionActive ? (
+                       <p className="text-xs md:text-sm mt-2 text-slate-500 animate-pulse">Menunggu peserta mengangkat tangan...</p>
+                     ) : (
+                       <p className="text-xs md:text-sm mt-2 text-slate-500">Tekan "Mulai" untuk membuka sesi baru.</p>
+                     )}
                    </div>
                  ) : (
                    <div className="grid gap-2 md:gap-3">
                      {queue.map((item, index) => {
                        const isActiveSpeaker = activeSpeakerId === item.id;
-                       const questionCount = getParticipantCount(item.name);
+                       // Pass businessName for accurate counting
+                       const questionCount = getParticipantCount(item.name, item.businessName);
                        
                        return (
                          <div 
@@ -289,11 +302,11 @@ export const AdminDashboard: React.FC = () => {
                           </p>
                         </div>
                         <div className="bg-blue-100 text-blue-700 px-3 py-1 rounded-full text-xs font-bold border border-blue-200">
-                          {session.participants.length} Penanya
+                          {Array.isArray(session.participants) ? session.participants.length : 0} Penanya
                         </div>
                       </div>
                       <div className="max-h-0 group-hover:max-h-96 transition-all duration-500 overflow-y-auto custom-scrollbar">
-                        {session.participants.length > 0 ? (
+                        {Array.isArray(session.participants) && session.participants.length > 0 ? (
                           <table className="w-full text-left text-sm text-slate-600">
                             <thead className="bg-slate-50 text-slate-400 uppercase text-xs font-semibold">
                               <tr>
@@ -316,7 +329,8 @@ export const AdminDashboard: React.FC = () => {
                                   <td className="hidden md:table-cell px-5 py-3">
                                     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-xs font-medium">
                                       <Trophy size={10} className="text-amber-500" />
-                                      {getParticipantCount(p.name)}x
+                                      {/* Pass businessName for accurate counting */}
+                                      {getParticipantCount(p.name, p.businessName)}x
                                     </span>
                                   </td>
                                   <td className="px-3 py-2 md:px-5 md:py-3 text-right font-mono text-slate-500 text-xs md:text-sm">{formatTime(p.timestamp)}</td>
