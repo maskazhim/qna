@@ -51,30 +51,20 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         if (isMounted && data) {
           
           // --- STABILITY LOGIC START ---
-          // Mencegah sesi 'tertutup sendiri' karena glitch sesaat dari Google Sheets.
-          // Kita hanya menutup sesi jika menerima status FALSE sebanyak 2x berturut-turut.
-          
           let stableIsSessionActive = data.isSessionActive;
 
           if (data.isSessionActive) {
-            // Jika server bilang TRUE, langsung percaya & reset counter error
             falseReadingCountRef.current = 0;
             stableIsSessionActive = true;
           } else {
-            // Jika server bilang FALSE...
             if (isSessionActiveRef.current === true) {
-              // ...tapi status lokal kita masih TRUE, curigai ini glitch
               falseReadingCountRef.current += 1;
-              
-              if (falseReadingCountRef.current < 3) { // Naikkan toleransi ke 3 kali poll (sekitar 9 detik)
-                 // Abaikan pembacaan FALSE sementara (anggap glitch jaringan/sheet)
+              if (falseReadingCountRef.current < 3) { 
                  stableIsSessionActive = true; 
               } else {
-                 // Jika sudah 3x berturut-turut FALSE, baru anggap valid tertutup
                  stableIsSessionActive = false;
               }
             } else {
-              // Jika lokal sudah FALSE, ya biarkan FALSE
               stableIsSessionActive = false;
             }
           }
@@ -82,7 +72,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
           setIsSessionActive(stableIsSessionActive);
           
-          // LOGIKA BARU: Jika sesi tertutup, paksa antrian kosong di UI
           if (!stableIsSessionActive) {
             setQueue([]);
           } else {
@@ -94,11 +83,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           setActiveSpeakerId(data.activeSpeakerId);
           
           setIsFirstLoad(false);
-          failCount = 0; // Reset fail count on success
+          failCount = 0;
         }
       } catch (error) {
         failCount++;
-        // Hanya log error jika gagal berturut-turut
         if (failCount < 3) {
           console.warn("Sync warning (retrying...):", error);
         }
@@ -130,12 +118,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const startSession = async () => {
     setIsLoading(true);
-    // Optimistic Update
     setIsSessionActive(true);
-    falseReadingCountRef.current = 0; // Reset glitch counter
+    falseReadingCountRef.current = 0;
     try {
       await api.startSession();
-      // Force immediate refresh
       const data = await api.fetchState();
       setQueue(data.queue || []);
     } catch (e) {
@@ -146,21 +132,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const stopSession = async () => {
-    // Hanya fungsi ini yang boleh menutup sesi di server
     setIsLoading(true);
-    setIsSessionActive(false); // Optimistic close
-    setQueue([]); // Langsung kosongkan antrian di UI
+    setIsSessionActive(false); 
+    setQueue([]); 
     
     try {
       await api.stopSession();
-      
-      // PENTING: Tunggu sebentar (1.5 detik) agar Script GAS selesai memindahkan data ke History
-      // sebelum kita fetch data terbaru. Ini memperbaiki masalah "History belum muncul".
       await new Promise(resolve => setTimeout(resolve, 1500));
-      
       const data = await api.fetchState();
       setHistory(data.history || []);
-      // Pastikan queue benar-benar kosong sesuai data server juga
       if (!data.isSessionActive) setQueue([]);
     } catch (e) {
       console.error("Failed to stop session", e);
@@ -172,7 +152,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const raiseHand = async () => {
     if (!user || !isSessionActive) return;
 
-    // CEK DUPLIKAT: Pastikan user dengan Nama & Bisnis yang sama belum ada di antrian
+    // CEK DUPLIKAT LOKAL
     const isDuplicate = queue.some(q => 
       q.name.toLowerCase() === user.name.toLowerCase() && 
       (q.businessName || '').toLowerCase() === (user.businessName || '').toLowerCase()
@@ -192,14 +172,25 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       timestamp: Date.now(),
     };
 
-    // Optimistic UI update
-    setQueue(prev => [...prev, newItem]);
+    // NOTE: Kita HAPUS optimistic UI update di sini agar UI menunggu balasan server
+    // setQueue(prev => [...prev, newItem]); 
 
     try {
       await api.raiseHand(newItem);
+      
+      // Setelah kirim, paksa fetch data terbaru agar dapat urutan valid dari spreadsheet
+      const data = await api.fetchState();
+      
+      // Update state dengan data valid dari server
+      if (data) {
+         setQueue(data.queue || []);
+         // Update info lain sekalian agar sinkron
+         setAnsweredUsers(data.answeredUsers || []);
+         setActiveSpeakerId(data.activeSpeakerId);
+      }
+      
     } catch (e) {
       console.error("Failed to raise hand", e);
-      setQueue(prev => prev.filter(q => q.id !== newItem.id));
     } finally {
       setIsLoading(false);
     }
@@ -219,7 +210,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const markAsAnswered = async (id: string) => {
     setIsLoading(true);
-    // Optimistic
     setActiveSpeakerId(null);
     setQueue(prev => prev.filter(q => q.id !== id));
     
@@ -238,7 +228,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     let count = 0;
     const compare = (itemName: string, itemBusiness?: string) => {
       const isNameMatch = itemName.toLowerCase() === name.toLowerCase();
-      // Jika businessName disediakan, cek juga. Jika tidak, cukup cek nama (backward compatibility/loose check)
       const isBusinessMatch = businessName 
         ? (itemBusiness || '').toLowerCase() === businessName.toLowerCase()
         : true; 
@@ -246,7 +235,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
 
     history.forEach(session => {
-      // Safety check for participants
       if (Array.isArray(session.participants)) {
         session.participants.forEach(p => {
           if (compare(p.name, p.businessName)) count++;
@@ -259,7 +247,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return count;
   };
 
-  // Logic Rank: Harus match Nama DAN Bisnis untuk menghindari salah identifikasi
   const currentUserRank = user && queue.length > 0 
     ? queue.findIndex(q => 
         q.name === user.name && 
