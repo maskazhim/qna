@@ -1,0 +1,5 @@
+{
+  "name": "Aksoro - Hand Tracking App",
+  "description": "Aplikasi tracking raise hand real-time dengan desain Glassmorphism. Fitur login, admin panel, antrian real-time, dan riwayat sesi.",
+  "requestFramePermissions": []
+}
