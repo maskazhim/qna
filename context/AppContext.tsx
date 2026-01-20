@@ -254,15 +254,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           throw sessionError;
       }
 
-      // 2. Update App State (Use UPSERT to ensure row 1 exists)
+      // 2. Update App State
+      // Using update instead of upsert for safety, assuming row 1 exists (handled by fetchInitialData)
       const { error: stateError } = await supabase
         .from('app_state')
-        .upsert({ 
-          id: 1,
+        .update({ 
           is_session_active: true, 
           current_session_id: sessionData.id,
           active_speaker_id: null
-        });
+        })
+        .eq('id', 1);
 
       if (stateError) {
           console.error("Error updating app_state:", stateError);
@@ -290,24 +291,29 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     try {
       // 1. Close current session
       if (currentSessionId) {
-        await supabase
+        const { error: sessionError } = await supabase
           .from('sessions')
           .update({ ended_at: new Date().toISOString() })
           .eq('id', currentSessionId);
+          
+        if (sessionError) throw sessionError;
       }
 
-      // 2. Update App State
-      await supabase
+      // 2. Update App State (Using UPDATE with EQ is safer than UPSERT for modifying existing state)
+      const { error: stateError } = await supabase
         .from('app_state')
-        .upsert({ 
-          id: 1,
+        .update({ 
           is_session_active: false, 
           active_speaker_id: null 
           // We keep current_session_id for reference until new one starts
-        });
+        })
+        .eq('id', 1);
 
-    } catch (e) {
+      if (stateError) throw stateError;
+
+    } catch (e: any) {
       console.error("Failed to stop session", e);
+      alert(`Gagal menghentikan sesi: ${e.message || 'Terjadi kesalahan'}`);
     } finally {
       setIsLoading(false);
     }
@@ -361,7 +367,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     try {
       await supabase
         .from('app_state')
-        .upsert({ id: 1, active_speaker_id: id });
+        .update({ active_speaker_id: id })
+        .eq('id', 1);
     } catch (e) {
       console.error("Failed to select speaker", e);
     }
@@ -382,7 +389,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       // 2. Reset speaker in global state
       await supabase
         .from('app_state')
-        .upsert({ id: 1, active_speaker_id: null });
+        .update({ active_speaker_id: null })
+        .eq('id', 1);
 
     } catch (e) {
        console.error("Failed to mark answered", e);
