@@ -2,19 +2,15 @@ import React, { useEffect, useState } from 'react';
 import { useApp } from '../context/AppContext';
 import { GlassCard } from '../components/GlassCard';
 import { Button } from '../components/Button';
-import { Hand, LogOut, Clock, Building2, Mic, PartyPopper, CheckCircle, Loader2, Hourglass } from 'lucide-react';
+import { Hand, LogOut, Clock, Building2, Mic, PartyPopper, CheckCircle, Hourglass } from 'lucide-react';
 
 export const UserDashboard: React.FC = () => {
-  const { user, logout, isSessionActive, raiseHand, currentUserRank, activeSpeakerId, queue, isLoading } = useApp();
+  const { user, logout, isSessionActive, raiseHand, currentUserRank, activeSpeakerId, queue } = useApp();
   
   // States for Popup Logic
   const [showRankPopup, setShowRankPopup] = useState(false);
   const [showSelectedPopup, setShowSelectedPopup] = useState(false);
   
-  // State for "Checking Order" flow
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [isValidatingRank, setIsValidatingRank] = useState(false);
-
   // Determine if current user is the active speaker
   const currentUserId = queue.find(q => 
     q.name === user?.name && 
@@ -23,50 +19,24 @@ export const UserDashboard: React.FC = () => {
 
   const isActiveSpeaker = currentUserId && activeSpeakerId === currentUserId;
 
-  // EFFECT: Handle Rank Popup
-  useEffect(() => {
-    // Show Rank popup ONLY if:
-    // 1. We are validating rank (user just clicked button) AND rank is now available
-    // 2. OR rank changes significantly (optional, but requested behavior focuses on post-click)
-    
-    if (currentUserRank && isValidatingRank) {
-       // Stop validating state
-       setIsValidatingRank(false);
-       // Show popup
-       setShowRankPopup(true);
-    }
-    
-    // Safety: If for some reason user is in queue but popup was closed, don't reopen unless validation flow triggers it.
-    // However, if speaker becomes active, close rank popup.
-    if (activeSpeakerId) {
-      setShowRankPopup(false);
-    }
-
-  }, [currentUserRank, isValidatingRank, activeSpeakerId]);
-
   // EFFECT: Handle Selected Speaker Popup
   useEffect(() => {
     if (isActiveSpeaker) {
       setShowSelectedPopup(true);
       setShowRankPopup(false);
-      setIsValidatingRank(false); // Ensure validation UI is closed if suddenly selected
     } else {
       setShowSelectedPopup(false);
     }
   }, [isActiveSpeaker]);
 
-  const handleRaiseHand = async () => {
-    if (isSessionActive && !currentUserRank && !isSubmitting) {
-      setIsSubmitting(true);
-      try {
-        await raiseHand();
-        // After await finishes (data sent to server & fetch triggered), set Validating state
-        setIsValidatingRank(true);
-      } catch (error) {
-        console.error("Error raising hand", error);
-      } finally {
-        setIsSubmitting(false);
-      }
+  const handleRaiseHand = () => {
+    if (isSessionActive && !currentUserRank) {
+      // 1. Trigger Raise Hand (Optimistic update happens immediately in Context)
+      // Kita tidak perlu menunggu (await) response server untuk update UI
+      raiseHand();
+      
+      // 2. Show Success Popup IMMEDIATELY
+      setShowRankPopup(true);
     }
   };
 
@@ -127,7 +97,7 @@ export const UserDashboard: React.FC = () => {
           
           <button
             onClick={handleRaiseHand}
-            disabled={!isSessionActive || currentUserRank !== null || isSubmitting || isValidatingRank}
+            disabled={!isSessionActive || currentUserRank !== null}
             className={`
               relative w-64 h-64 rounded-full flex flex-col items-center justify-center gap-4
               transition-all duration-500 border-4 shadow-[0_10px_40px_rgba(0,0,0,0.1)]
@@ -135,7 +105,7 @@ export const UserDashboard: React.FC = () => {
                 ? 'bg-green-500 border-green-400 text-white scale-110 shadow-green-500/50 ring-4 ring-green-200'
                 : !isSessionActive 
                   ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed grayscale' 
-                  : (currentUserRank || isValidatingRank)
+                  : currentUserRank
                     ? 'bg-green-50 border-green-400 text-green-600 cursor-default ring-4 ring-green-100'
                     : 'bg-white hover:bg-slate-50 border-white text-blue-600 hover:scale-105 active:scale-95'
               }
@@ -147,17 +117,6 @@ export const UserDashboard: React.FC = () => {
                  <Mic size={80} className="animate-bounce" />
                  <span className="text-xl font-bold tracking-wider uppercase">GILIRAN ANDA</span>
               </>
-            ) : isValidatingRank ? (
-              <div className="flex flex-col items-center animate-[fadeIn_0.5s_ease-out]">
-                 <Loader2 size={60} className="animate-spin text-green-500 mb-2" />
-                 <span className="text-lg font-bold text-green-700">Berhasil!</span>
-                 <span className="text-xs font-medium text-green-600/80 mt-1">Verifikasi antrian...</span>
-              </div>
-            ) : isSubmitting ? (
-              <div className="flex flex-col items-center">
-                 <Loader2 size={60} className="animate-spin text-blue-500 mb-2" />
-                 <span className="text-base font-semibold text-slate-500">Mengirim...</span>
-              </div>
             ) : currentUserRank ? (
               <div className="flex flex-col items-center animate-[fadeIn_0.5s_ease-out]">
                 <Hourglass size={80} className="animate-pulse text-green-500" />
@@ -177,9 +136,7 @@ export const UserDashboard: React.FC = () => {
         <p className="mt-8 text-slate-500 text-center text-sm max-w-xs font-medium min-h-[40px]">
           {isActiveSpeaker 
             ? "Admin telah memilih Anda. Silahkan ajukan pertanyaan Anda sekarang."
-            : isValidatingRank
-              ? "Permintaan Anda telah diterima. Mohon tunggu sebentar..."
-              : isSessionActive 
+            : isSessionActive 
                 ? currentUserRank 
                   ? "Anda sudah masuk dalam daftar antrian. Mohon tunggu giliran Anda dipanggil." 
                   : "Tekan tombol di atas untuk masuk ke dalam antrian pertanyaan."

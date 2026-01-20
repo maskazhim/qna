@@ -24,15 +24,6 @@ export interface SessionHistory {
   participants: QueueItem[]; // List of users who got a turn (answered)
 }
 
-// Data shape returned from Google Apps Script
-export interface ApiState {
-  isSessionActive: boolean;
-  activeSpeakerId: string | null;
-  queue: QueueItem[];
-  history: SessionHistory[];
-  answeredUsers: QueueItem[];
-}
-
 export interface AppContextType {
   user: User | null;
   login: (name: string, role: UserRole, businessName?: string) => void;
@@ -48,5 +39,5 @@ export interface AppContextType {
   selectSpeaker: (id: string) => Promise<void>;
   markAsAnswered: (id: string) => Promise<void>;
   getParticipantCount: (name: string, businessName?: string) => number;
-  isLoading: boolean; // Added for UI feedback
+  isLoading: boolean;
 }

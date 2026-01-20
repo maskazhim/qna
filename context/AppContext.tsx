@@ -1,32 +1,24 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode, useRef } from 'react';
 import { AppContextType, QueueItem, SessionHistory, User, UserRole } from '../types';
-import { api } from '../services/googleSheetApi';
+import { supabase } from '../services/supabaseClient';
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  // Local state for User Identity (Still stored locally)
+  // --- Local User State ---
   const [user, setUser] = useState<User | null>(null);
   
-  // Synced state from Spreadsheet
+  // --- Synced State (Supabase) ---
   const [isSessionActive, setIsSessionActive] = useState<boolean>(false);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [activeSpeakerId, setActiveSpeakerId] = useState<string | null>(null);
+  
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [answeredUsers, setAnsweredUsers] = useState<QueueItem[]>([]);
   const [history, setHistory] = useState<SessionHistory[]>([]);
-  const [activeSpeakerId, setActiveSpeakerId] = useState<string | null>(null);
   
-  // UI States
+  // --- UI States ---
   const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [isFirstLoad, setIsFirstLoad] = useState<boolean>(true); // Untuk mencegah flicker "Sesi Tertutup" saat awal buka
-
-  // Refs to track state inside interval closure without re-triggering it
-  const isSessionActiveRef = useRef(isSessionActive);
-  const falseReadingCountRef = useRef(0);
-
-  // Update ref whenever state changes
-  useEffect(() => {
-    isSessionActiveRef.current = isSessionActive;
-  }, [isSessionActive]);
 
   // Load User from LocalStorage on mount
   useEffect(() => {
@@ -40,70 +32,199 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   }, []);
 
-  // POLLING MECHANISM: Fetch data from GAS every 3 seconds
-  useEffect(() => {
-    let isMounted = true;
-    let failCount = 0;
+  // --- INITIAL DATA FETCH ---
+  const fetchInitialData = async () => {
+    try {
+      setIsLoading(true);
 
-    const fetchData = async () => {
-      try {
-        const data = await api.fetchState();
-        if (isMounted && data) {
-          
-          // --- STABILITY LOGIC START ---
-          let stableIsSessionActive = data.isSessionActive;
-
-          if (data.isSessionActive) {
-            falseReadingCountRef.current = 0;
-            stableIsSessionActive = true;
-          } else {
-            if (isSessionActiveRef.current === true) {
-              falseReadingCountRef.current += 1;
-              if (falseReadingCountRef.current < 3) { 
-                 stableIsSessionActive = true; 
-              } else {
-                 stableIsSessionActive = false;
-              }
-            } else {
-              stableIsSessionActive = false;
-            }
-          }
-          // --- STABILITY LOGIC END ---
-
-          setIsSessionActive(stableIsSessionActive);
-          
-          if (!stableIsSessionActive) {
-            setQueue([]);
-          } else {
-            setQueue(data.queue || []);
-          }
-
-          setAnsweredUsers(data.answeredUsers || []);
-          setHistory(data.history || []);
-          setActiveSpeakerId(data.activeSpeakerId);
-          
-          setIsFirstLoad(false);
-          failCount = 0;
+      // 1. Get App State
+      let { data: stateData, error: stateError } = await supabase
+        .from('app_state')
+        .select('*')
+        .eq('id', 1)
+        .maybeSingle(); // Use maybeSingle to avoid error if row doesn't exist
+      
+      // SELF HEALING: If app_state row doesn't exist, create it.
+      if (!stateData) {
+        console.log("App state missing, initializing...");
+        const { data: newData, error: initError } = await supabase
+          .from('app_state')
+          .insert([{ id: 1, is_session_active: false, current_session_id: null, active_speaker_id: null }])
+          .select()
+          .single();
+        
+        if (initError) {
+            console.error("Critical: Failed to initialize app_state. Check API Key/RLS.", initError);
+            throw initError;
         }
-      } catch (error) {
-        failCount++;
-        if (failCount < 3) {
-          console.warn("Sync warning (retrying...):", error);
+        stateData = newData;
+      }
+      
+      if (stateError) throw stateError;
+      
+      if (stateData) {
+        setIsSessionActive(stateData.is_session_active);
+        setCurrentSessionId(stateData.current_session_id);
+        setActiveSpeakerId(stateData.active_speaker_id);
+
+        // 2. Get Queue (Waiting) for current session
+        if (stateData.current_session_id) {
+          const { data: queueData, error: queueError } = await supabase
+            .from('queue')
+            .select('*')
+            .eq('session_id', stateData.current_session_id)
+            .eq('status', 'waiting')
+            .order('created_at', { ascending: true });
+
+          if (!queueError && queueData) {
+            const mappedQueue: QueueItem[] = queueData.map(item => ({
+               id: item.id,
+               name: item.name,
+               businessName: item.business_name,
+               timestamp: new Date(item.created_at).getTime()
+            }));
+            setQueue(mappedQueue);
+          }
+
+          // 3. Get Answered for current session
+          const { data: ansData } = await supabase
+            .from('queue')
+            .select('*')
+            .eq('session_id', stateData.current_session_id)
+            .eq('status', 'answered');
+            
+          if (ansData) {
+             const mappedAns: QueueItem[] = ansData.map(item => ({
+               id: item.id,
+               name: item.name,
+               businessName: item.business_name,
+               timestamp: new Date(item.created_at).getTime()
+            }));
+            setAnsweredUsers(mappedAns);
+          }
         }
       }
-    };
 
-    // Initial fetch
-    fetchData();
+      // 4. Load History (Sessions that ended)
+      await fetchHistory();
 
-    // Poll every 3 seconds
-    const intervalId = setInterval(fetchData, 3000);
+    } catch (error) {
+      console.error("Error fetching initial data:", error);
+      // alert("Gagal memuat data. Periksa koneksi internet atau API Key Supabase Anda.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const fetchHistory = async () => {
+    const { data: sessionData } = await supabase
+      .from('sessions')
+      .select(`
+        id, created_at, ended_at,
+        queue (id, name, business_name, created_at, status)
+      `)
+      .not('ended_at', 'is', null)
+      .order('created_at', { ascending: false });
+
+    if (sessionData) {
+      const mappedHistory: SessionHistory[] = sessionData.map(s => ({
+        id: s.id,
+        startTime: new Date(s.created_at).getTime(),
+        endTime: new Date(s.ended_at).getTime(),
+        participants: Array.isArray(s.queue) 
+          ? s.queue.map((q: any) => ({
+              id: q.id,
+              name: q.name,
+              businessName: q.business_name,
+              timestamp: new Date(q.created_at).getTime()
+            }))
+          : []
+      }));
+      setHistory(mappedHistory);
+    }
+  };
+
+  // --- SUPABASE REALTIME SUBSCRIPTIONS ---
+  useEffect(() => {
+    fetchInitialData();
+
+    // Channel for App State (Active Session, Speaker)
+    const stateChannel = supabase.channel('public:app_state')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_state', filter: 'id=eq.1' }, (payload) => {
+        const newData = payload.new as any;
+        if (newData) {
+            setIsSessionActive(newData.is_session_active);
+            setCurrentSessionId(newData.current_session_id);
+            setActiveSpeakerId(newData.active_speaker_id);
+            
+            // If session turned off, clear local queue visually
+            if (!newData.is_session_active) {
+              setQueue([]);
+              setAnsweredUsers([]);
+              fetchHistory(); 
+            }
+        }
+      })
+      .subscribe();
+
+    // Channel for Queue (Insertions, Updates)
+    const queueChannel = supabase.channel('public:queue')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'queue' }, async (payload) => {
+        
+        // If it's an INSERT (Raise Hand)
+        if (payload.eventType === 'INSERT') {
+           const newItem = payload.new;
+           // Only add if it belongs to current active session and is waiting
+           if (newItem.status === 'waiting' && newItem.session_id === currentSessionIdRef.current) {
+              setQueue(prev => {
+                // Prevent duplicate addition from realtime if we already added it optimistically
+                if (prev.some(p => p.id === newItem.id)) return prev;
+                
+                return [...prev, {
+                  id: newItem.id,
+                  name: newItem.name,
+                  businessName: newItem.business_name,
+                  timestamp: new Date(newItem.created_at).getTime()
+                }];
+              });
+           }
+        }
+
+        // If it's an UPDATE (Marked Answered)
+        if (payload.eventType === 'UPDATE') {
+          const updatedItem = payload.new;
+          if (updatedItem.status === 'answered') {
+             // Remove from queue
+             setQueue(prev => prev.filter(q => q.id !== updatedItem.id));
+             // Add to answered (optional, for count consistency)
+             setAnsweredUsers(prev => {
+                 if (prev.some(p => p.id === updatedItem.id)) return prev;
+                 return [...prev, {
+                    id: updatedItem.id,
+                    name: updatedItem.name,
+                    businessName: updatedItem.business_name,
+                    timestamp: new Date(updatedItem.created_at).getTime()
+                 }];
+             });
+          }
+        }
+      })
+      .subscribe();
 
     return () => {
-      isMounted = false;
-      clearInterval(intervalId);
+      supabase.removeChannel(stateChannel);
+      supabase.removeChannel(queueChannel);
     };
-  }, []);
+  }, []); // Run once on mount
+
+  // Ref to access currentSessionId inside realtime callback closure
+  const currentSessionIdRef = useRef(currentSessionId);
+  useEffect(() => {
+    currentSessionIdRef.current = currentSessionId;
+  }, [currentSessionId]);
+
+
+  // --- ACTIONS ---
 
   const login = (name: string, role: UserRole, businessName?: string) => {
     const newUser = { name, role, businessName };
@@ -118,14 +239,47 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const startSession = async () => {
     setIsLoading(true);
-    setIsSessionActive(true);
-    falseReadingCountRef.current = 0;
     try {
-      await api.startSession();
-      const data = await api.fetchState();
-      setQueue(data.queue || []);
-    } catch (e) {
-      console.error("Failed to start session", e);
+      console.log("Starting session...");
+      // 1. Create new session row
+      const { data: sessionData, error: sessionError } = await supabase
+        .from('sessions')
+        .insert([{ created_at: new Date().toISOString() }])
+        .select()
+        .single();
+
+      if (sessionError) {
+          console.error("Error creating session:", sessionError);
+          alert(`Gagal membuat sesi: ${sessionError.message}`);
+          throw sessionError;
+      }
+
+      // 2. Update App State (Use UPSERT to ensure row 1 exists)
+      const { error: stateError } = await supabase
+        .from('app_state')
+        .upsert({ 
+          id: 1,
+          is_session_active: true, 
+          current_session_id: sessionData.id,
+          active_speaker_id: null
+        });
+
+      if (stateError) {
+          console.error("Error updating app_state:", stateError);
+          alert(`Gagal mengupdate status: ${stateError.message}`);
+          throw stateError;
+      }
+
+      console.log("Session started successfully");
+      // Local update handles by Realtime, but let's reset queue locally just in case
+      setQueue([]);
+      setAnsweredUsers([]);
+
+    } catch (e: any) {
+      console.error("Failed to start session Exception", e);
+      if (e?.code === 'PGRST301' || e?.message?.includes('JWT')) {
+          alert("Koneksi ditolak. Mohon cek 'Anon Key' Supabase Anda di services/supabaseClient.ts");
+      }
     } finally {
       setIsLoading(false);
     }
@@ -133,15 +287,25 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const stopSession = async () => {
     setIsLoading(true);
-    setIsSessionActive(false); 
-    setQueue([]); 
-    
     try {
-      await api.stopSession();
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      const data = await api.fetchState();
-      setHistory(data.history || []);
-      if (!data.isSessionActive) setQueue([]);
+      // 1. Close current session
+      if (currentSessionId) {
+        await supabase
+          .from('sessions')
+          .update({ ended_at: new Date().toISOString() })
+          .eq('id', currentSessionId);
+      }
+
+      // 2. Update App State
+      await supabase
+        .from('app_state')
+        .upsert({ 
+          id: 1,
+          is_session_active: false, 
+          active_speaker_id: null 
+          // We keep current_session_id for reference until new one starts
+        });
+
     } catch (e) {
       console.error("Failed to stop session", e);
     } finally {
@@ -150,90 +314,93 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const raiseHand = async () => {
-    if (!user || !isSessionActive) return;
+    if (!user || !isSessionActive || !currentSessionId) return;
 
-    // CEK DUPLIKAT LOKAL
-    const isDuplicate = queue.some(q => 
-      q.name.toLowerCase() === user.name.toLowerCase() && 
-      (q.businessName || '').toLowerCase() === (user.businessName || '').toLowerCase()
-    );
-
-    if (isDuplicate) {
-      console.warn("User already in queue (Duplicate prevention)");
-      return; 
-    }
-
-    setIsLoading(true);
-
+    // OPTIMISTIC UI: Add to local queue immediately
+    const tempId = crypto.randomUUID();
     const newItem: QueueItem = {
-      id: crypto.randomUUID(),
+      id: tempId,
       name: user.name,
       businessName: user.businessName,
       timestamp: Date.now(),
     };
+    
+    // Check duplicate locally
+    if (queue.some(q => q.name === user.name && q.businessName === user.businessName)) return;
 
-    // NOTE: Kita HAPUS optimistic UI update di sini agar UI menunggu balasan server
-    // setQueue(prev => [...prev, newItem]); 
+    setQueue(prev => [...prev, newItem]);
 
     try {
-      await api.raiseHand(newItem);
-      
-      // Setelah kirim, paksa fetch data terbaru agar dapat urutan valid dari spreadsheet
-      const data = await api.fetchState();
-      
-      // Update state dengan data valid dari server
-      if (data) {
-         setQueue(data.queue || []);
-         // Update info lain sekalian agar sinkron
-         setAnsweredUsers(data.answeredUsers || []);
-         setActiveSpeakerId(data.activeSpeakerId);
-      }
-      
+      const { data, error } = await supabase
+        .from('queue')
+        .insert([{
+          session_id: currentSessionId,
+          name: user.name,
+          business_name: user.businessName,
+          status: 'waiting'
+        }])
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      // Replace temp item with real item from DB (ID correction)
+      setQueue(prev => prev.map(q => q.id === tempId ? { ...q, id: data.id } : q));
+
     } catch (e) {
       console.error("Failed to raise hand", e);
-    } finally {
-      setIsLoading(false);
+      // Rollback
+      setQueue(prev => prev.filter(q => q.id !== tempId));
+      alert("Gagal mengangkat tangan. Cek koneksi.");
     }
   };
 
   const selectSpeaker = async (id: string) => {
-    setIsLoading(true);
-    setActiveSpeakerId(id); // Optimistic
+    // Optimistic
+    setActiveSpeakerId(id);
     try {
-      await api.selectSpeaker(id);
+      await supabase
+        .from('app_state')
+        .upsert({ id: 1, active_speaker_id: id });
     } catch (e) {
       console.error("Failed to select speaker", e);
-    } finally {
-      setIsLoading(false);
     }
   };
 
   const markAsAnswered = async (id: string) => {
-    setIsLoading(true);
+    // Optimistic
     setActiveSpeakerId(null);
     setQueue(prev => prev.filter(q => q.id !== id));
     
     try {
-      await api.markAnswered(id);
-      const data = await api.fetchState();
-      setAnsweredUsers(data.answeredUsers || []);
+      // 1. Update queue item status
+      await supabase
+        .from('queue')
+        .update({ status: 'answered' })
+        .eq('id', id);
+
+      // 2. Reset speaker in global state
+      await supabase
+        .from('app_state')
+        .upsert({ id: 1, active_speaker_id: null });
+
     } catch (e) {
        console.error("Failed to mark answered", e);
-    } finally {
-      setIsLoading(false);
     }
   };
 
+  // Helper to count total questions across history + current answered
   const getParticipantCount = (name: string, businessName?: string): number => {
     let count = 0;
     const compare = (itemName: string, itemBusiness?: string) => {
       const isNameMatch = itemName.toLowerCase() === name.toLowerCase();
       const isBusinessMatch = businessName 
-        ? (itemBusiness || '').toLowerCase() === businessName.toLowerCase()
+        ? (itemBusiness || '').toLowerCase() === (businessName || '').toLowerCase()
         : true; 
       return isNameMatch && isBusinessMatch;
     };
 
+    // Check History
     history.forEach(session => {
       if (Array.isArray(session.participants)) {
         session.participants.forEach(p => {
@@ -241,9 +408,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     });
+
+    // Check Current Answered (Realtime)
     answeredUsers.forEach(p => {
       if (compare(p.name, p.businessName)) count++;
     });
+
     return count;
   };
 
