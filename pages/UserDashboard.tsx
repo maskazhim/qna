@@ -5,7 +5,7 @@ import { Button } from '../components/Button';
 import { Hand, LogOut, Clock, Building2, Mic, PartyPopper, CheckCircle, Hourglass } from 'lucide-react';
 
 export const UserDashboard: React.FC = () => {
-  const { user, logout, isSessionActive, raiseHand, currentUserRank, activeSpeakerId, queue } = useApp();
+  const { user, logout, isSessionActive, raiseHand, currentUserRank, activeSpeakerId, queue, eventName } = useApp();
   
   // States for Popup Logic
   const [showRankPopup, setShowRankPopup] = useState(false);
@@ -70,6 +70,9 @@ export const UserDashboard: React.FC = () => {
       {/* Main Content */}
       <div className="flex-1 flex flex-col items-center justify-center w-full max-w-md">
         
+        {/* Event Name */}
+        <h1 className="text-2xl font-bold text-slate-800 mb-6 text-center tracking-tight">{eventName || 'Event Aksoro'}</h1>
+
         {/* Status Indicator */}
         <div className="mb-8 text-center">
           {isActiveSpeaker ? (

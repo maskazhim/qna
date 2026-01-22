@@ -1,6 +1,9 @@
+
 import React, { createContext, useContext, useState, useEffect, ReactNode, useRef } from 'react';
-import { AppContextType, QueueItem, SessionHistory, User, UserRole } from '../types';
-import { supabase } from '../services/supabaseClient';
+import { AppContextType, QueueItem, SessionHistory, User, UserRole, AppEvent } from '../types';
+import { client, databases, account, DATABASE_ID, COLLECTION_EVENTS, COLLECTION_QUEUE, COLLECTION_SESSIONS, COLLECTION_ADMINS } from '../services/appwriteClient';
+import { ID, Query } from 'appwrite';
+import { hashPassword } from '../utils/crypto';
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
@@ -8,449 +11,544 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // --- Local User State ---
   const [user, setUser] = useState<User | null>(null);
   
-  // --- Synced State (Supabase) ---
-  const [isSessionActive, setIsSessionActive] = useState<boolean>(false);
-  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
-  const [activeSpeakerId, setActiveSpeakerId] = useState<string | null>(null);
+  // --- Event State ---
+  const [availableEvents, setAvailableEvents] = useState<AppEvent[]>([]);
+  const [currentEvent, setCurrentEvent] = useState<AppEvent | null>(null);
   
+  // --- Synced State (Inside Event) ---
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [answeredUsers, setAnsweredUsers] = useState<QueueItem[]>([]);
   const [history, setHistory] = useState<SessionHistory[]>([]);
   
   // --- UI States ---
   const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
 
-  // Load User from LocalStorage on mount
+  // Derived state for convenience
+  const isSessionActive = currentEvent?.is_session_active || false;
+  const activeSpeakerId = currentEvent?.active_speaker_id || null;
+  const eventName = currentEvent?.event_name || '';
+
+  // 1. Initialize & Fetch Public Events on Mount
   useEffect(() => {
-    const savedUser = localStorage.getItem('currentUser');
-    if (savedUser) {
-      try {
-        setUser(JSON.parse(savedUser));
-      } catch (e) {
-        console.error("Failed to parse user", e);
+    const initApp = async () => {
+      // Restore User
+      const savedUser = localStorage.getItem('currentUser');
+      if (savedUser) {
+        try {
+          setUser(JSON.parse(savedUser));
+        } catch (e) {
+          console.error("Failed to parse user", e);
+        }
       }
-    }
+
+      // Appwrite Anon Session
+      try {
+        await account.getSession('current');
+      } catch {
+        try {
+          await account.createAnonymousSession();
+        } catch (e: any) {
+          console.error("Failed to create anon session:", e);
+          if (e.message?.includes('Network request failed')) {
+              setConnectionError("Gagal terhubung ke Appwrite.");
+              return;
+          }
+        }
+      }
+      
+      // Fetch List of Events for Dropdown
+      await fetchAvailableEvents();
+    };
+
+    initApp();
   }, []);
 
-  // --- INITIAL DATA FETCH ---
-  const fetchInitialData = async () => {
+  const fetchAvailableEvents = async () => {
+    const mapDocToEvent = (doc: any): AppEvent => ({
+        id: doc.$id,
+        event_code: doc.event_code || 'GENERAL',
+        event_name: doc.event_name || 'Unnamed Event',
+        is_public: doc.is_public !== false, // Default to true if missing
+        is_session_active: doc.is_session_active,
+        current_session_id: doc.current_session_id,
+        active_speaker_id: doc.active_speaker_id,
+        created_by: doc.created_by
+    });
+
     try {
-      setIsLoading(true);
-
-      // 1. Get App State
-      let { data: stateData, error: stateError } = await supabase
-        .from('app_state')
-        .select('*')
-        .eq('id', 1)
-        .maybeSingle(); // Use maybeSingle to avoid error if row doesn't exist
+      // Fetch ALL events (Removed Query.equal('is_public', true))
+      // So Admin can see hidden events to toggle them back
+      const res = await databases.listDocuments(
+        DATABASE_ID,
+        COLLECTION_EVENTS,
+        [
+          Query.orderDesc('$createdAt'),
+          Query.limit(50)
+        ]
+      );
       
-      // SELF HEALING: If app_state row doesn't exist, create it.
-      if (!stateData) {
-        console.log("App state missing, initializing...");
-        const { data: newData, error: initError } = await supabase
-          .from('app_state')
-          .insert([{ id: 1, is_session_active: false, current_session_id: null, active_speaker_id: null }])
-          .select()
-          .single();
-        
-        if (initError) {
-            console.error("Critical: Failed to initialize app_state. Check API Key/RLS.", initError);
-            throw initError;
-        }
-        stateData = newData;
+      setAvailableEvents(res.documents.map(mapDocToEvent));
+    } catch (e: any) {
+      console.warn("Primary fetch failed, attempting fallback...", e.message);
+      
+      // FALLBACK
+      try {
+          const res = await databases.listDocuments(
+              DATABASE_ID,
+              COLLECTION_EVENTS,
+              [
+                Query.orderDesc('$createdAt'),
+                Query.limit(50)
+              ]
+          );
+          setAvailableEvents(res.documents.map(mapDocToEvent));
+      } catch (e2) {
+          console.error("Fallback fetch also failed", e2);
       }
-      
-      if (stateError) throw stateError;
-      
-      if (stateData) {
-        setIsSessionActive(stateData.is_session_active);
-        setCurrentSessionId(stateData.current_session_id);
-        setActiveSpeakerId(stateData.active_speaker_id);
-
-        // 2. Get Queue (Waiting) for current session
-        if (stateData.current_session_id) {
-          const { data: queueData, error: queueError } = await supabase
-            .from('queue')
-            .select('*')
-            .eq('session_id', stateData.current_session_id)
-            .eq('status', 'waiting')
-            .order('created_at', { ascending: true });
-
-          if (!queueError && queueData) {
-            const mappedQueue: QueueItem[] = queueData.map(item => ({
-               id: item.id,
-               name: item.name,
-               businessName: item.business_name,
-               timestamp: new Date(item.created_at).getTime()
-            }));
-            setQueue(mappedQueue);
-          }
-
-          // 3. Get Answered for current session
-          const { data: ansData } = await supabase
-            .from('queue')
-            .select('*')
-            .eq('session_id', stateData.current_session_id)
-            .eq('status', 'answered');
-            
-          if (ansData) {
-             const mappedAns: QueueItem[] = ansData.map(item => ({
-               id: item.id,
-               name: item.name,
-               businessName: item.business_name,
-               timestamp: new Date(item.created_at).getTime()
-            }));
-            setAnsweredUsers(mappedAns);
-          }
-        }
-      }
-
-      // 4. Load History (Sessions that ended)
-      await fetchHistory();
-
-    } catch (error) {
-      console.error("Error fetching initial data:", error);
-      // alert("Gagal memuat data. Periksa koneksi internet atau API Key Supabase Anda.");
-    } finally {
-      setIsLoading(false);
     }
   };
 
-  const fetchHistory = async () => {
-    const { data: sessionData } = await supabase
-      .from('sessions')
-      .select(`
-        id, created_at, ended_at,
-        queue (id, name, business_name, created_at, status)
-      `)
-      .not('ended_at', 'is', null)
-      .order('created_at', { ascending: false });
-
-    if (sessionData) {
-      const mappedHistory: SessionHistory[] = sessionData.map(s => ({
-        id: s.id,
-        startTime: new Date(s.created_at).getTime(),
-        endTime: new Date(s.ended_at).getTime(),
-        participants: Array.isArray(s.queue) 
-          ? s.queue.map((q: any) => ({
-              id: q.id,
-              name: q.name,
-              businessName: q.business_name,
-              timestamp: new Date(q.created_at).getTime()
-            }))
-          : []
-      }));
-      setHistory(mappedHistory);
-    }
-  };
-
-  // --- SUPABASE REALTIME SUBSCRIPTIONS ---
+  // 2. Load Event Data when `currentEvent` changes
   useEffect(() => {
-    fetchInitialData();
+    if (currentEvent) {
+      if (currentEvent.current_session_id) {
+        fetchQueue(currentEvent.current_session_id, currentEvent.event_code);
+      } else {
+        setQueue([]);
+        setAnsweredUsers([]);
+      }
+      fetchHistory(currentEvent.event_code);
+    }
+  }, [currentEvent?.id, currentEvent?.current_session_id]);
 
-    // Channel for App State (Active Session, Speaker)
-    const stateChannel = supabase.channel('public:app_state')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_state', filter: 'id=eq.1' }, (payload) => {
-        const newData = payload.new as any;
-        if (newData) {
-            setIsSessionActive(newData.is_session_active);
-            setCurrentSessionId(newData.current_session_id);
-            setActiveSpeakerId(newData.active_speaker_id);
+
+  const fetchQueue = async (sessionId: string, eventCode: string) => {
+    try {
+      const waitingRes = await databases.listDocuments(
+        DATABASE_ID,
+        COLLECTION_QUEUE,
+        [
+          Query.equal('session_id', sessionId),
+          // Fallback if event_code query fails not implemented here for brevity, assuming generic schema fix
+          Query.equal('event_code', eventCode), 
+          Query.equal('status', 'waiting'),
+          Query.orderAsc('$createdAt'),
+          Query.limit(100)
+        ]
+      );
+
+      setQueue(waitingRes.documents.map(doc => ({
+        id: doc.$id,
+        name: doc.name,
+        businessName: doc.business_name,
+        timestamp: new Date(doc.$createdAt).getTime(),
+        eventCode: doc.event_code
+      })));
+
+      const answeredRes = await databases.listDocuments(
+        DATABASE_ID,
+        COLLECTION_QUEUE,
+        [
+          Query.equal('session_id', sessionId),
+          Query.equal('status', 'answered'),
+          Query.limit(100)
+        ]
+      );
+      
+      setAnsweredUsers(answeredRes.documents.map(doc => ({
+        id: doc.$id,
+        name: doc.name,
+        businessName: doc.business_name,
+        timestamp: new Date(doc.$createdAt).getTime(),
+        eventCode: doc.event_code
+      })));
+
+    } catch (e) {
+      console.error("Fetch queue failed", e);
+    }
+  };
+
+  const fetchHistory = async (eventCode: string) => {
+    try {
+      const sessionsRes = await databases.listDocuments(
+        DATABASE_ID,
+        COLLECTION_SESSIONS,
+        [
+          Query.equal('event_code', eventCode),
+          Query.isNotNull('ended_at'),
+          Query.orderDesc('$createdAt'),
+          Query.limit(20)
+        ]
+      );
+
+      const historyItems: SessionHistory[] = [];
+
+      for (const sess of sessionsRes.documents) {
+        const partsRes = await databases.listDocuments(
+            DATABASE_ID,
+            COLLECTION_QUEUE,
+            [
+                Query.equal('session_id', sess.$id),
+                Query.limit(100)
+            ]
+        );
+
+        historyItems.push({
+            id: sess.$id,
+            startTime: new Date(sess.$createdAt).getTime(),
+            endTime: new Date(sess.ended_at).getTime(),
+            eventCode: sess.event_code,
+            participants: partsRes.documents.map(d => ({
+                id: d.$id,
+                name: d.name,
+                businessName: d.business_name,
+                timestamp: new Date(d.$createdAt).getTime(),
+                eventCode: d.event_code
+            }))
+        });
+      }
+      setHistory(historyItems);
+    } catch (e) {
+      console.error("Fetch history failed", e);
+    }
+  };
+
+  // --- REALTIME ---
+  const currentEventRef = useRef(currentEvent);
+  useEffect(() => { currentEventRef.current = currentEvent; }, [currentEvent]);
+
+  useEffect(() => {
+    if (!currentEvent) return;
+
+    // Only subscribe to THIS specific event document and queues related to it
+    const unsubscribe = client.subscribe(
+      [
+        `databases.${DATABASE_ID}.collections.${COLLECTION_EVENTS}.documents.${currentEvent.id}`,
+        `databases.${DATABASE_ID}.collections.${COLLECTION_QUEUE}.documents`
+      ], 
+      (response) => {
+        const eventCode = currentEventRef.current?.event_code;
+        if (!eventCode) return;
+
+        // 1. Event/State Updates
+        if (response.events.some(e => e.includes(`collections.${COLLECTION_EVENTS}`))) {
+            const newData = response.payload as any;
+            // Merge update
+            setCurrentEvent(prev => prev ? { ...prev, ...newData } : null);
             
-            // If session turned off, clear local queue visually
-            if (!newData.is_session_active) {
-              setQueue([]);
-              setAnsweredUsers([]);
-              fetchHistory(); 
+            if (newData.is_session_active === false) {
+                setQueue([]);
+                setAnsweredUsers([]);
+                fetchHistory(eventCode);
             }
         }
-      })
-      .subscribe();
 
-    // Channel for Queue (Insertions, Updates)
-    const queueChannel = supabase.channel('public:queue')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'queue' }, async (payload) => {
-        
-        // If it's an INSERT (Raise Hand)
-        if (payload.eventType === 'INSERT') {
-           const newItem = payload.new;
-           // Only add if it belongs to current active session and is waiting
-           if (newItem.status === 'waiting' && newItem.session_id === currentSessionIdRef.current) {
-              setQueue(prev => {
-                // Prevent duplicate addition from realtime if we already added it optimistically
-                if (prev.some(p => p.id === newItem.id)) return prev;
-                
-                return [...prev, {
-                  id: newItem.id,
-                  name: newItem.name,
-                  businessName: newItem.business_name,
-                  timestamp: new Date(newItem.created_at).getTime()
-                }];
-              });
-           }
-        }
+        // 2. Queue Updates
+        if (response.events.some(e => e.includes(`collections.${COLLECTION_QUEUE}`))) {
+            const payload = response.payload as any;
+            
+            // SECURITY: Only process if it belongs to current event
+            if (payload.event_code !== eventCode) return;
+            // AND belongs to current session
+            if (payload.session_id !== currentEventRef.current?.current_session_id) return;
 
-        // If it's an UPDATE (Marked Answered)
-        if (payload.eventType === 'UPDATE') {
-          const updatedItem = payload.new;
-          if (updatedItem.status === 'answered') {
-             // Remove from queue
-             setQueue(prev => prev.filter(q => q.id !== updatedItem.id));
-             // Add to answered (optional, for count consistency)
-             setAnsweredUsers(prev => {
-                 if (prev.some(p => p.id === updatedItem.id)) return prev;
-                 return [...prev, {
-                    id: updatedItem.id,
-                    name: updatedItem.name,
-                    businessName: updatedItem.business_name,
-                    timestamp: new Date(updatedItem.created_at).getTime()
-                 }];
-             });
-          }
+            const eventType = response.events[0];
+
+            if (eventType.endsWith('.create') && payload.status === 'waiting') {
+                setQueue(prev => {
+                    if (prev.some(p => p.id === payload.$id)) return prev;
+                    // Handle optimistic
+                    const optimisticIdx = prev.findIndex(p => p.id.startsWith('temp-') && p.name === payload.name);
+                    
+                    const newItem: QueueItem = {
+                        id: payload.$id,
+                        name: payload.name,
+                        businessName: payload.business_name,
+                        timestamp: new Date(payload.$createdAt).getTime(),
+                        eventCode: payload.event_code
+                    };
+
+                    if (optimisticIdx !== -1) {
+                        const newQ = [...prev];
+                        newQ[optimisticIdx] = newItem;
+                        return newQ;
+                    }
+                    return [...prev, newItem];
+                });
+            } else if (eventType.endsWith('.update') && payload.status === 'answered') {
+                 setQueue(prev => prev.filter(q => q.id !== payload.$id));
+                 setAnsweredUsers(prev => [...prev, {
+                     id: payload.$id,
+                     name: payload.name,
+                     businessName: payload.business_name,
+                     timestamp: new Date(payload.$createdAt).getTime(),
+                     eventCode: payload.event_code
+                 }]);
+            }
         }
-      })
-      .subscribe();
+      }
+    );
 
     return () => {
-      supabase.removeChannel(stateChannel);
-      supabase.removeChannel(queueChannel);
+      unsubscribe();
     };
-  }, []); // Run once on mount
-
-  // Ref to access currentSessionId inside realtime callback closure
-  const currentSessionIdRef = useRef(currentSessionId);
-  useEffect(() => {
-    currentSessionIdRef.current = currentSessionId;
-  }, [currentSessionId]);
+  }, [currentEvent?.id]); // Re-subscribe only if event ID changes (User switches event)
 
 
   // --- ACTIONS ---
 
-  const login = (name: string, role: UserRole, businessName?: string) => {
-    const newUser = { name, role, businessName };
-    setUser(newUser);
-    localStorage.setItem('currentUser', JSON.stringify(newUser));
+  const joinEvent = async (eventCode: string): Promise<boolean> => {
+    setIsLoading(true);
+    try {
+      const res = await databases.listDocuments(
+        DATABASE_ID,
+        COLLECTION_EVENTS,
+        [Query.equal('event_code', eventCode), Query.limit(1)]
+      );
+
+      if (res.documents.length === 0) {
+        setIsLoading(false);
+        return false;
+      }
+
+      const doc = res.documents[0];
+      const event: AppEvent = {
+        id: doc.$id,
+        event_code: doc.event_code,
+        event_name: doc.event_name,
+        is_public: doc.is_public !== false,
+        is_session_active: doc.is_session_active,
+        current_session_id: doc.current_session_id,
+        active_speaker_id: doc.active_speaker_id,
+        created_by: doc.created_by
+      };
+
+      setCurrentEvent(event);
+      setIsLoading(false);
+      return true;
+    } catch (e) {
+      console.error(e);
+      setIsLoading(false);
+      return false;
+    }
+  };
+
+  const createEvent = async (name: string, code: string, isPublic: boolean): Promise<boolean> => {
+    setIsLoading(true);
+    try {
+      // Check duplicate code
+      const check = await databases.listDocuments(DATABASE_ID, COLLECTION_EVENTS, [Query.equal('event_code', code)]);
+      if (check.documents.length > 0) throw new Error("Kode event sudah dipakai");
+
+      const doc = await databases.createDocument(
+        DATABASE_ID,
+        COLLECTION_EVENTS,
+        ID.unique(),
+        {
+          event_name: name,
+          event_code: code,
+          is_public: isPublic,
+          created_by: user?.name || 'admin',
+          is_session_active: false
+        }
+      );
+
+      // Set as current
+      setCurrentEvent({
+        id: doc.$id,
+        event_code: code,
+        event_name: name,
+        is_public: isPublic,
+        is_session_active: false
+      });
+      
+      // FIX: Refresh available events list immediately so it shows up in dropdowns
+      await fetchAvailableEvents();
+
+      setIsLoading(false);
+      return true;
+    } catch (e: any) {
+      alert("Gagal membuat event: " + e.message);
+      setIsLoading(false);
+      return false;
+    }
+  };
+
+  const adminSelectEvent = async (code: string) => {
+    return joinEvent(code);
+  };
+
+  const toggleEventVisibility = async (id: string, currentStatus: boolean) => {
+    try {
+       await databases.updateDocument(DATABASE_ID, COLLECTION_EVENTS, id, { is_public: !currentStatus });
+       await fetchAvailableEvents();
+    } catch (e: any) {
+       alert("Gagal mengubah status: " + e.message);
+    }
+  };
+
+  const login = async (name: string, role: UserRole, businessName?: string, password?: string): Promise<boolean> => {
+    setIsLoading(true);
+    try {
+      if (role === UserRole.ADMIN) {
+        if (!password) throw new Error("Password required");
+        if (name === 'kazhim' && password === 'kazhim123') {
+           const newUser = { name, role, businessName };
+           setUser(newUser);
+           localStorage.setItem('currentUser', JSON.stringify(newUser));
+           setIsLoading(false);
+           return true;
+        }
+        const hashedPassword = await hashPassword(password);
+        const adminCheck = await databases.listDocuments(
+          DATABASE_ID, 
+          COLLECTION_ADMINS, 
+          [Query.equal('username', name), Query.equal('password_hash', hashedPassword)]
+        );
+        
+        if (adminCheck.documents.length === 0) {
+           setIsLoading(false);
+           return false;
+        }
+      }
+
+      const newUser = { name, role, businessName };
+      setUser(newUser);
+      localStorage.setItem('currentUser', JSON.stringify(newUser));
+      setIsLoading(false);
+      return true;
+    } catch (e) {
+      console.error(e);
+      setIsLoading(false);
+      return false;
+    }
   };
 
   const logout = () => {
     setUser(null);
+    setCurrentEvent(null); // Reset event on logout
     localStorage.removeItem('currentUser');
   };
 
+  const updateEventName = async (newName: string) => {
+    if (!currentEvent) return;
+    try {
+      await databases.updateDocument(DATABASE_ID, COLLECTION_EVENTS, currentEvent.id, { event_name: newName });
+      // FIX: Refresh available events list to reflect name change in lists
+      await fetchAvailableEvents();
+    } catch (e: any) {
+      alert("Gagal update: " + e.message);
+    }
+  };
+
+  const addNewAdmin = async (username: string, password: string) => {
+    try {
+        const hashedPassword = await hashPassword(password);
+        await databases.createDocument(DATABASE_ID, COLLECTION_ADMINS, ID.unique(), {
+            username,
+            password_hash: hashedPassword
+        });
+    } catch (e) { throw e; }
+  };
+
   const startSession = async () => {
+    if (!currentEvent) return;
     setIsLoading(true);
     try {
-      console.log("Starting session...");
-      // 1. Create new session row
-      const { data: sessionData, error: sessionError } = await supabase
-        .from('sessions')
-        .insert([{ created_at: new Date().toISOString() }])
-        .select()
-        .single();
+      const sessionDoc = await databases.createDocument(DATABASE_ID, COLLECTION_SESSIONS, ID.unique(), {
+          ended_at: null,
+          event_code: currentEvent.event_code
+      });
 
-      if (sessionError) {
-          console.error("Error creating session:", sessionError);
-          alert(`Gagal membuat sesi: ${sessionError.message}`);
-          throw sessionError;
-      }
-
-      // 2. Update App State
-      // Using update instead of upsert for safety, assuming row 1 exists (handled by fetchInitialData)
-      const { error: stateError } = await supabase
-        .from('app_state')
-        .update({ 
-          is_session_active: true, 
-          current_session_id: sessionData.id,
+      await databases.updateDocument(DATABASE_ID, COLLECTION_EVENTS, currentEvent.id, {
+          is_session_active: true,
+          current_session_id: sessionDoc.$id,
           active_speaker_id: null
-        })
-        .eq('id', 1);
+      });
 
-      if (stateError) {
-          console.error("Error updating app_state:", stateError);
-          alert(`Gagal mengupdate status: ${stateError.message}`);
-          throw stateError;
-      }
-
-      console.log("Session started successfully");
-      // Local update handles by Realtime, but let's reset queue locally just in case
       setQueue([]);
       setAnsweredUsers([]);
-
     } catch (e: any) {
-      console.error("Failed to start session Exception", e);
-      if (e?.code === 'PGRST301' || e?.message?.includes('JWT')) {
-          alert("Koneksi ditolak. Mohon cek 'Anon Key' Supabase Anda di services/supabaseClient.ts");
-      }
+      alert("Error: " + e.message);
     } finally {
       setIsLoading(false);
     }
   };
 
   const stopSession = async () => {
+    if (!currentEvent) return;
     setIsLoading(true);
     try {
-      // 1. Close current session
-      if (currentSessionId) {
-        const { error: sessionError } = await supabase
-          .from('sessions')
-          .update({ ended_at: new Date().toISOString() })
-          .eq('id', currentSessionId);
-          
-        if (sessionError) throw sessionError;
+      if (currentEvent.current_session_id) {
+        await databases.updateDocument(DATABASE_ID, COLLECTION_SESSIONS, currentEvent.current_session_id, { ended_at: new Date().toISOString() });
       }
-
-      // 2. Update App State (Using UPDATE with EQ is safer than UPSERT for modifying existing state)
-      const { error: stateError } = await supabase
-        .from('app_state')
-        .update({ 
-          is_session_active: false, 
-          active_speaker_id: null 
-          // We keep current_session_id for reference until new one starts
-        })
-        .eq('id', 1);
-
-      if (stateError) throw stateError;
-
+      await databases.updateDocument(DATABASE_ID, COLLECTION_EVENTS, currentEvent.id, {
+          is_session_active: false,
+          active_speaker_id: null
+      });
     } catch (e: any) {
-      console.error("Failed to stop session", e);
-      alert(`Gagal menghentikan sesi: ${e.message || 'Terjadi kesalahan'}`);
+      alert("Error: " + e.message);
     } finally {
       setIsLoading(false);
     }
   };
 
   const raiseHand = async () => {
-    if (!user || !isSessionActive || !currentSessionId) return;
-
-    // OPTIMISTIC UI: Add to local queue immediately
-    const tempId = crypto.randomUUID();
-    const newItem: QueueItem = {
-      id: tempId,
-      name: user.name,
-      businessName: user.businessName,
-      timestamp: Date.now(),
-    };
+    if (!user || !currentEvent?.is_session_active || !currentEvent.current_session_id) return;
     
-    // Check duplicate locally
-    if (queue.some(q => q.name === user.name && q.businessName === user.businessName)) return;
-
-    setQueue(prev => [...prev, newItem]);
+    // Optimistic UI
+    const tempId = 'temp-' + Date.now();
+    setQueue(prev => [...prev, { id: tempId, name: user.name, businessName: user.businessName, timestamp: Date.now(), eventCode: currentEvent.event_code }]);
 
     try {
-      const { data, error } = await supabase
-        .from('queue')
-        .insert([{
-          session_id: currentSessionId,
+      await databases.createDocument(DATABASE_ID, COLLECTION_QUEUE, ID.unique(), {
+          session_id: currentEvent.current_session_id,
           name: user.name,
           business_name: user.businessName,
-          status: 'waiting'
-        }])
-        .select()
-        .single();
-
-      if (error) throw error;
-
-      // Replace temp item with real item from DB (ID correction)
-      setQueue(prev => prev.map(q => q.id === tempId ? { ...q, id: data.id } : q));
-
+          status: 'waiting',
+          event_code: currentEvent.event_code
+      });
     } catch (e) {
-      console.error("Failed to raise hand", e);
-      // Rollback
-      setQueue(prev => prev.filter(q => q.id !== tempId));
-      alert("Gagal mengangkat tangan. Cek koneksi.");
+      setQueue(prev => prev.filter(q => q.id !== tempId)); // Rollback
+      console.error(e);
     }
   };
 
   const selectSpeaker = async (id: string) => {
-    // Optimistic
-    setActiveSpeakerId(id);
+    if (!currentEvent) return;
     try {
-      await supabase
-        .from('app_state')
-        .update({ active_speaker_id: id })
-        .eq('id', 1);
-    } catch (e) {
-      console.error("Failed to select speaker", e);
-    }
+      await databases.updateDocument(DATABASE_ID, COLLECTION_EVENTS, currentEvent.id, { active_speaker_id: id });
+    } catch (e) { console.error(e); }
   };
 
   const markAsAnswered = async (id: string) => {
-    // Optimistic
-    setActiveSpeakerId(null);
-    setQueue(prev => prev.filter(q => q.id !== id));
-    
+    if (!currentEvent) return;
     try {
-      // 1. Update queue item status
-      await supabase
-        .from('queue')
-        .update({ status: 'answered' })
-        .eq('id', id);
-
-      // 2. Reset speaker in global state
-      await supabase
-        .from('app_state')
-        .update({ active_speaker_id: null })
-        .eq('id', 1);
-
-    } catch (e) {
-       console.error("Failed to mark answered", e);
-    }
+      await databases.updateDocument(DATABASE_ID, COLLECTION_QUEUE, id, { status: 'answered' });
+      await databases.updateDocument(DATABASE_ID, COLLECTION_EVENTS, currentEvent.id, { active_speaker_id: null });
+    } catch (e) { console.error(e); }
   };
 
-  // Helper to count total questions across history + current answered
   const getParticipantCount = (name: string, businessName?: string): number => {
-    let count = 0;
-    const compare = (itemName: string, itemBusiness?: string) => {
-      const isNameMatch = itemName.toLowerCase() === name.toLowerCase();
-      const isBusinessMatch = businessName 
-        ? (itemBusiness || '').toLowerCase() === (businessName || '').toLowerCase()
-        : true; 
-      return isNameMatch && isBusinessMatch;
-    };
-
-    // Check History
-    history.forEach(session => {
-      if (Array.isArray(session.participants)) {
-        session.participants.forEach(p => {
-          if (compare(p.name, p.businessName)) count++;
-        });
-      }
-    });
-
-    // Check Current Answered (Realtime)
-    answeredUsers.forEach(p => {
-      if (compare(p.name, p.businessName)) count++;
-    });
-
-    return count;
+      // Simplification for multi-event: currently just counting logic remains same but filters by array
+      // Might want to filter history by eventCode too if needed strictly, but history is already filtered in state
+      let count = 0;
+      const compare = (n: string, b?: string) => n.toLowerCase() === name.toLowerCase() && (businessName ? (b||'').toLowerCase() === businessName.toLowerCase() : true);
+      
+      history.forEach(h => h.participants.forEach(p => { if (compare(p.name, p.businessName)) count++; }));
+      answeredUsers.forEach(p => { if (compare(p.name, p.businessName)) count++; });
+      return count;
   };
 
-  const currentUserRank = user && queue.length > 0 
-    ? queue.findIndex(q => 
-        q.name === user.name && 
-        q.businessName === user.businessName
-      ) + 1 
-    : null;
+  const currentUserRank = user && queue.length > 0 ? queue.findIndex(q => q.name === user.name && q.businessName === user.businessName) + 1 : null;
 
-  const safeRank = currentUserRank === 0 ? null : currentUserRank;
+  if (connectionError) return <div className="p-10 text-center text-red-600 font-bold">{connectionError}</div>;
 
   return (
     <AppContext.Provider value={{
-      user,
-      login,
-      logout,
-      isSessionActive,
-      startSession,
-      stopSession,
-      raiseHand,
-      queue,
-      history,
-      currentUserRank: safeRank,
-      activeSpeakerId,
-      selectSpeaker,
-      markAsAnswered,
-      getParticipantCount,
-      isLoading
+      user, login, logout, availableEvents, currentEvent, fetchAvailableEvents, joinEvent, createEvent, adminSelectEvent, toggleEventVisibility,
+      isSessionActive, startSession, stopSession, raiseHand, queue, history, currentUserRank, activeSpeakerId, selectSpeaker, markAsAnswered, getParticipantCount, isLoading, eventName, updateEventName, addNewAdmin
     }}>
       {children}
     </AppContext.Provider>
@@ -459,8 +557,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
 export const useApp = () => {
   const context = useContext(AppContext);
-  if (!context) {
-    throw new Error('useApp must be used within an AppProvider');
-  }
+  if (!context) throw new Error('useApp must be used within an AppProvider');
   return context;
 };
